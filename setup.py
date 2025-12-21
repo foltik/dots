@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+
+import os, platform, subprocess, shutil, stat
+from pathlib import Path
+
+#------ Environment ------------------------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent
+PREFIX = ROOT/'prefix'
+PKGS = PREFIX/'pkgs'
+WORK = PREFIX/'work'
+
+PREFIX.mkdir(parents=True, exist_ok=True)
+
+sys  = platform.system().lower()  # linux  | darwin
+arch = platform.machine().lower() # x86_64 | arm64
+host = os.uname().nodename        # navi
+triple = {
+    ('x86_64','linux'): 'x86_64-unknown-linux-gnu',
+    ('arm64','darwin'): 'aarch64-apple-darwin',
+}[(arch, sys)]
+
+print('Probing environment...')
+print(f'  Host: {host}')
+print(f'  System: {sys}-{arch}')
+
+#------ Primitives -------------------------------------------------------------------------------------------
+
+def sh(c: str, cwd: Path = None):
+    subprocess.run(['bash', '--noprofile', '--norc', '-euo', 'pipefail', '-c', c], check=True, cwd=cwd)
+
+PLAN = {}
+DEPS = {}
+def pkg(*, deps=set()):
+    def decorator(fn):
+        name = fn.__name__
+        def plan(v, *args, **kwargs):
+            def build():
+                d = PKGS/name
+                marker = d/'version'
+                if not marker.exists() or marker.read_text().strip() != v:
+                    print(f'\n================ BUILDING {name} {v} ================')
+                    sh(f'rm -rf {d} && mkdir {d}')
+                    fn(d, v, *args, **kwargs)
+                    marker.write_text(v)
+
+            print(f'  {name} {v}')
+            DEPS[name] = deps
+            PLAN[name] = build
+
+        return plan
+    return decorator
+
+#------ Helpers ----------------------------------------------------------------------------------------------
+
+def extract(url: str, dest: Path):
+    dest.mkdir(parents=True, exist_ok=True)
+    if   url.endswith(('.tar.gz','.tgz')): sh(f'curl -L {url} | tar xzf - -C {dest}')
+    elif url.endswith('.tar.xz'):          sh(f'curl -L {url} | tar xJf - -C {dest}')
+    elif url.endswith('.zip'):
+        zip = dest/'temp.zip'
+        sh(f'curl -L {url} -o {zip} && unzip -q {zip} -d {dest} && rm -f {zip}')
+    else: raise ValueError(f'unknown archive format: {url}')
+
+def install(exe: Path, d: Path):
+    sh(f'mkdir -p {d}/bin')
+    sh(f'chmod +x {exe}')
+    sh(f'mv {exe} {d}/bin/')
+
+def build_autotools(src: Path, prefix: Path, *args, env: str = '', use_clang: bool = False):
+    clang = PKGS/'clang/bin/clang'
+    clang = f'CC={clang} CXX={clang}++' if use_clang else ''
+
+    sh(f'{env} ./configure --prefix={prefix} {clang} {" ".join(args)}', cwd=src)
+    sh(f'{env} make -j$(nproc) && {env} make install', cwd=src)
+
+def build_automake(src: Path, prefix: Path, *args, env: str = ''):
+    automake = PKGS/'automake'
+    sh(f'{env} PATH="{automake}/bin:$PATH" autoreconf --install', cwd=src)
+    build_autotools(src, prefix, *args)
+
+def build_cmake(src: Path, prefix: Path, *args, use_clang: bool = False, targets: list[str] = [], env: str = ''):
+    components = targets
+    targets = ' '.join(f'--target {t}' for t in targets)
+    clang = PKGS/'clang/bin/clang'
+    cmake = PKGS/'cmake/bin/cmake'
+    compiler = f'-DCMAKE_C_COMPILER={clang} -DCMAKE_CXX_COMPILER={clang}++' if use_clang else ''
+    build = WORK/f'{prefix.name}-build'
+    sh(f'{env} {cmake} -S {src} -B {build} {compiler} -DCMAKE_INSTALL_PREFIX={prefix} -DCMAKE_BUILD_TYPE=Release {" ".join(args)}')
+    sh(f'{env} {cmake} --build {build} {targets} -j$(nproc)')
+    if len(components) == 0:
+        sh(f'{cmake} --install {build}')
+    else:
+        for c in components:
+            sh(f'{cmake} --install {build} --component {c}')
+
+def build_meson(src: Path, prefix: Path, *args, env: str = ''):
+    clang = PKGS/'clang/bin/clang'
+    meson = f'PYTHONPATH="{PKGS}/meson/lib/python3.14/site-packages" {PKGS}/meson/bin/meson'
+    ninja = PKGS/'ninja'
+    sh(f'{env} PATH="{ninja}/bin:$PATH" CC={clang} CXX={clang}++ CC_LD=lld CXX_LD=lld {meson} setup build --prefix={prefix} {" ".join(args)}', cwd=src)
+    sh(f'{meson} compile -C build', cwd=src)
+    sh(f'{meson} install -C build', cwd=src)
+
+def build_cargo(d: Path, v: str, crate: str):
+    rust = PKGS/'rust'
+    cargo = f'RUSTUP_HOME={rust}/rustup CARGO_HOME={rust} PATH="{rust}/bin:$PATH" cargo'
+    sh(f'{cargo} install {crate}@{v} --locked --root {d}')
+
+def build_pip(d: Path, v: str, package: str):
+    pip = PKGS/'python/bin/pip3'
+    sh(f'{pip} install {package}=={v} --prefix={d}')
+
+#------ Toolchains -------------------------------------------------------------------------------------------
+
+@pkg()
+def m4(d: Path, v: str):
+    extract(f'https://ftp.gnu.org/gnu/m4/m4-{v}.tar.xz', WORK)
+    build_autotools(WORK/f'm4-{v}', d)
+
+@pkg()
+def pkgconfig(d: Path, v: str):
+    extract(f'https://pkgconfig.freedesktop.org/releases/pkg-config-{v}.tar.gz', WORK)
+    build_autotools(WORK/f'pkg-config-{v}', d)
+
+@pkg()
+def ninja(d: Path, v: str):
+    platform = {
+        'x86_64-unknown-linux-gnu': 'linux'
+    }[triple]
+    extract(f'https://github.com/ninja-build/ninja/releases/download/v{v}/ninja-{platform}.zip', WORK)
+    install(WORK/'ninja', d)
+
+@pkg(deps={'m4'})
+def automake(d: Path, v: str):
+    m4 = PKGS/'m4'
+    vars = f'PATH="{d}/bin:{m4}/bin:$PATH"'
+
+    libtool_v = '2.5.4'
+    extract(f'https://mirror.us-midwest-1.nexcess.net/gnu/libtool/libtool-{libtool_v}.tar.xz', WORK)
+    build_autotools(WORK/f'libtool-{libtool_v}', d, vars)
+
+    autoconf_v = '2.72'
+    extract(f'https://ftp.gnu.org/gnu/autoconf/autoconf-{autoconf_v}.tar.xz', WORK)
+    build_autotools(WORK/f'autoconf-{autoconf_v}', d, vars)
+
+    extract(f'https://ftp.gnu.org/gnu/automake/automake-{v}.tar.xz', WORK)
+    build_autotools(WORK/f'automake-{v}', d, vars)
+
+@pkg()
+def cmake(d: Path, v: str):
+    tag = {('darwin','arm64'):'macos-universal', ('linux','x86_64'):'linux-x86_64'}[(sys, arch)]
+    extract(f'https://github.com/Kitware/CMake/releases/download/v{v}/cmake-{v}-{tag}.tar.gz', WORK)
+    if sys=='darwin':
+        sh(f'mv {WORK}/cmake-{v}-{tag}/CMake.app/Contents/{{bin,share}} {d}')
+    else:
+        sh(f'mv {WORK}/cmake-{v}-{tag}/{{bin,share}} {d}')
+    sh(f'rm -f {d}/bin/cmake-gui')
+
+@pkg()
+def sqlite(d: Path, v: str):
+    extract(f'https://www.sqlite.org/2025/sqlite-autoconf-{v}.tar.gz', WORK)
+    build_autotools(WORK/f'sqlite-autoconf-{v}', d)
+
+@pkg(deps={'sqlite'})
+def python(d: Path, v: str):
+    sqlite = PKGS/'sqlite/lib'
+    extract(f'https://www.python.org/ftp/python/{v}/Python-{v}.tgz', WORK)
+    build_autotools(WORK/f'Python-{v}', d, '--disable-test-modules',
+        f'PKG_CONFIG_PATH="{sqlite}/pkgconfig"',
+        env=f'LD_LIBRARY_PATH="{sqlite}"')
+
+@pkg(deps={'python', 'cmake'})
+def clang(d: Path, v: str):
+    extract(f"https://github.com/llvm/llvm-project/releases/download/llvmorg-{v}/llvm-project-{v}.src.tar.xz", WORK)
+    build_cmake(
+        WORK/f'llvm-project-{v}.src/llvm', d,
+        '-DLLVM_ENABLE_PROJECTS="lld;clang;clang-tools-extra"',
+        '-DLLVM_TARGETS_TO_BUILD="X86;AArch64"',
+        '-DLLVM_ENABLE_LLD=OFF',
+        '-DLLVM_INCLUDE_EXAMPLES=OFF',
+        '-DLLVM_INCLUDE_TESTS=OFF',
+        use_clang=False,
+        targets=['lld', 'clang', 'llvm-ar', 'llvm-ranlib', 'clang-resource-headers', 'clangd'],
+    )
+
+@pkg(deps={'python'})
+def meson(d: Path, v: str):
+    build_pip(d, v, 'meson')
+
+@pkg()
+def rust(d: Path, v: str):
+    vars = f'RUSTUP_HOME={d}/rustup CARGO_HOME={d}'
+    sh(f'curl -L https://static.rust-lang.org/rustup/dist/{triple}/rustup-init -o {WORK}/rustup-init')
+    sh(f'chmod +x {WORK}/rustup-init')
+    sh(f'RUSTUP_HOME={d}/rustup CARGO_HOME={d} {WORK}/rustup-init --default-toolchain {v} --no-modify-path -y')
+    sh(f'{vars} {WORK}/rustup-init --default-toolchain {v} --no-modify-path -y')
+    sh(f'{vars} PATH="{d}/bin:$PATH" rustup component remove rust-docs')
+
+@pkg()
+def node(d: Path, v: str):
+    tag = {('linux','x86_64'):'linux-x64', ('darwin','arm64'):'darwin-arm64'}[(sys, arch)]
+    extract(f'https://nodejs.org/dist/v{v}/node-v{v}-{tag}.tar.xz', WORK)
+    sh(f'mv {WORK}/node-v{v}-{tag}/* {d}')
+
+@pkg(deps={'cmake', 'rust'})
+def fish(d: Path, v: str):
+    rust = PKGS/'rust'
+    vars = f'PATH="{rust}/bin:$PATH" RUSTUP_HOME={rust}/rustup CARGO_HOME={rust}'
+
+    extract(f'https://github.com/fish-shell/fish-shell/releases/download/{v}/fish-{v}.tar.xz', WORK)
+    build_cmake(WORK/f'fish-{v}', d, env=vars)
+
+@pkg(deps={'cmake'})
+def libevent(d: Path, v: str):
+    extract(f'https://github.com/libevent/libevent/releases/download/release-{v}/libevent-{v}.tar.gz', WORK)
+    build_cmake(WORK/f'libevent-{v}', d)
+    sh(f'rm -rf {d}/bin')
+
+@pkg(deps={'cmake'})
+def libutf8proc(d: Path, v: str):
+    extract(f'https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v{v}.tar.gz', WORK)
+    build_cmake(WORK/f'utf8proc-{v}', d)
+
+@pkg(deps={'cmake', 'libevent', 'libutf8proc'})
+def tmux(d: Path, v: str):
+    flags = ''
+    if sys == 'darwin':
+        flags = f'PKG_CONFIG_PATH={PKGS}/libutf8proc/lib/pkgconfig --enable-utf8proc' if sys == 'darwin' else ''
+
+    extract(f'https://github.com/tmux/tmux/releases/download/{v}/tmux-{v}.tar.gz', WORK)
+    build_autotools(
+        WORK/f'tmux-{v}', d,
+        f'CFLAGS="-I{PKGS}/libevent/include" LDFLAGS="-L{PKGS}/libevent/lib"',
+        flags,
+    )
+
+@pkg()
+def nvim(d: Path, v: str):
+    tag = {('linux','x86_64'):'linux-x86_64', ('darwin','arm64'):'macos-arm64'}[(sys, arch)]
+    extract(f"https://github.com/neovim/neovim/releases/download/v{v}/nvim-{tag}.tar.gz", WORK)
+    sh(f'mv {WORK}/nvim-{tag}/* {d}')
+
+@pkg()
+def uv(d: Path, v: str):
+    extract(f'https://github.com/astral-sh/uv/releases/download/{v}/uv-{triple}.tar.gz', WORK)
+    sh(f'mkdir -p {d}/bin')
+    sh(f'mv {WORK}/uv-{triple}/uv {WORK}/uv-{triple}/uvx {d}/bin/')
+
+@pkg()
+def codex(d: Path, v: str):
+    tag = triple.replace('gnu', 'musl')
+    extract(f'https://github.com/openai/codex/releases/download/rust-v{v}/codex-{tag}.tar.gz', WORK)
+    install(WORK/f'codex-{tag}', d)
+    sh(f'mv {d}/bin/codex-{tag} {d}/bin/codex')
+
+# Get latest version with `curl -LO https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/stable`
+# See https://claude.ai/install.sh 
+@pkg()
+def claude(d: Path, v: str):
+    tag = {('linux','x86_64'):'linux-x64', ('darwin','arm64'):'darwin-arm64'}[(sys, arch)]
+    dest = d/'bin'
+    sh(f'mkdir -p {dest}')
+    sh(f'curl -Lo {dest}/claude https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{v}/{tag}/claude')
+    sh(f'chmod +x {dest}/claude')
+
+@pkg()
+def lua_ls(d: Path, v: str):
+    tag = {('linux','x86_64'):'linux-x64', ('darwin','arm64'):'darwin-arm64'}[(sys, arch)]
+    extract(f'https://github.com/LuaLS/lua-language-server/releases/download/{v}/lua-language-server-{v}-{tag}.tar.gz', d/'lua_ls')
+    sh(f'mkdir {d}/bin && ln -sfr {d}/lua_ls/bin/lua-language-server {d}/bin/')
+
+@pkg()
+def starship(d: Path, v: str):
+    extract(f'https://github.com/starship/starship/releases/download/v{v}/starship-{triple}.tar.gz', WORK)
+    install(WORK/'starship', d)
+
+@pkg()
+def zoxide(d: Path, v: str):
+    tag = triple.replace('gnu', 'musl')
+    extract(f'https://github.com/ajeetdsouza/zoxide/releases/download/v{v}/zoxide-{v}-{tag}.tar.gz', WORK/'zoxide')
+    install(f'{WORK}/zoxide/zoxide', d)
+
+@pkg()
+def direnv(d: Path, v: str):
+    tag = {('linux','x86_64'):'linux-amd64', ('darwin','arm64'):'darwin-arm64',}[(sys, arch)]
+    sh(f'curl -L https://github.com/direnv/direnv/releases/download/v{v}/direnv.{tag} -o {WORK}/direnv')
+    install(WORK/'direnv', d)
+
+@pkg(deps={'rust'})
+def eza(d: Path, v: str):
+    build_cargo(d, v, 'eza')
+
+@pkg()
+def ripgrep(d: Path, v: str):
+    tag = triple.replace('gnu', 'musl')
+    extract(f'https://github.com/BurntSushi/ripgrep/releases/download/{v}/ripgrep-{v}-{tag}.tar.gz', WORK)
+    install(WORK/f'ripgrep-{v}-{tag}/rg', d)
+
+@pkg()
+def fd(d: Path, v: str):
+    extract(f'https://github.com/sharkdp/fd/releases/download/v{v}/fd-v{v}-{triple}.tar.gz', WORK)
+    install(WORK/f'fd-v{v}-{triple}/fd', d)
+
+@pkg()
+def sd(d: Path, v: str):
+    extract(f'https://github.com/chmln/sd/releases/download/v{v}/sd-v{v}-{triple}.tar.gz', WORK)
+    install(WORK/f'sd-v{v}-{triple}/sd', d)
+
+@pkg()
+def dua(d: Path, v: str):
+    build_cargo(d, v, 'dua-cli')
+
+@pkg()
+def libxml2(d: Path, v: str):
+    vv = '.'.join(v.split('.')[:2]) # 2.15.1 -> 2.15
+    extract(f'https://download.gnome.org/sources/libxml2/{vv}/libxml2-{v}.tar.xz', WORK)
+    build_autotools(
+        WORK/f'libxml2-{v}', d, 
+        'CFLAGS="-fPIC"',
+        '--without-python --without-docbook --without-icu',
+        '--disable-shared --enable-static',
+    )
+
+@pkg(deps={'libxml2'})
+def wireshark(d: Path, v: str):
+    extract(f'https://2.na.dl.wireshark.org/src/wireshark-{v}.tar.xz', WORK)
+    disable = [f'-DBUILD_{tool}=OFF' for tool in [
+        'wireshark','rawshark','sharkd','tfshark','capinfos','editcap',
+        'mergecap','reordercap','text2pcap','randpkt','randpktdump',
+        'mmdbresolve','ciscodump','sshdump','wifidump','udpdump',
+        'androiddump','dpauxmon','sdjournal','captype'
+    ]]
+    build_cmake(
+        WORK/f'wireshark-{v}', d,
+        f'-DLIBXML2_INCLUDE_DIR={PKGS}/libxml2/include/libxml2 -DLIBXML2_LIBRARY={PKGS}/libxml2/lib/libxml2.a',
+        '-DENABLE_EXTCAP=OFF',
+        '-DENABLE_PLUGINS=OFF'
+        '-DBUILD_tshark=ON',
+        '-DBUILD_dumpcap=ON',
+        *disable,
+    )
+
+@pkg(deps={'wireshark'})
+def termshark(d: Path, v: str):
+    tag = {('linux','x86_64'):'linux_x64', ('darwin','arm64'):'MacOS_arm64',}[(sys, arch)]
+    extract(f'https://github.com/gcla/termshark/releases/download/v{v}/termshark_{v}_{tag}.tar.gz', WORK)
+    install(WORK/f'termshark_{v}_{tag}/termshark', d)
+
+@pkg()
+def libpcap(d: Path, v: str):
+    extract(f'https://www.tcpdump.org/release/libpcap-{v}.tar.xz', WORK)
+    build_autotools(WORK/f'libpcap-{v}', d)
+
+@pkg(deps={'libpcap'})
+def tcpreplay(d: Path, v: str):
+    libpcap = PKGS/'libpcap'
+    extract(f'https://github.com/appneta/tcpreplay/releases/download/v{v}/tcpreplay-{v}.tar.xz', WORK)
+    build_autotools(
+        WORK/f'tcpreplay-{v}', d,
+        f'--with-libpcap={libpcap}',
+        f'CFLAGS="-I{libpcap}/include" LDFLAGS="-L{libpcap}/lib"',
+    )
+
+@pkg(deps={'automake'})
+def vde2(d: Path, v: str):
+    extract(f'https://github.com/virtualsquare/vde-2/archive/refs/tags/v{v}.tar.gz', WORK)
+    build_automake(WORK/f'vde-2-{v}', d)
+
+# --- run ----------------------------------------------------------------------------------------------------
+if __name__ == '__main__':
+    print('\nAdding packages: base')
+
+    # Toolchains
+    pkgconfig('0.29.2')
+    ninja('1.13.2')
+    m4('1.4.20')
+    automake('1.18.1')
+    sqlite('3510100')
+    python('3.14.0')
+    if sys=='linux': clang('21.1.0')
+    cmake('3.31.9')
+    meson('1.9.2')
+    rust('nightly')
+    node('24.12.0')
+
+    # Tmux
+    libevent('2.1.12-stable')
+    if sys == 'darwin': libutf8proc('2.11.0')
+    tmux('3.5a')
+
+    # Shell
+    fish('4.1.2')
+    starship('1.24.0')
+    zoxide('0.9.8')
+    direnv('2.37.1')
+    # Tools
+    ripgrep('15.1.0')
+    eza('0.23.4')
+    fd('10.3.0')
+    sd('1.0.0')
+    dua('2.32.2')
+
+    # Coding
+    nvim('0.11.4')
+    # Lua
+    lua_ls('3.15.0')
+    # Python
+    uv('0.9.18')
+    # AI
+    codex('0.52.0')
+    claude('2.0.64')
+
+    # Networking
+    libpcap('1.10.5')
+    libxml2('2.15.1')
+    wireshark('4.6.2')
+    termshark('2.4.0')
+    tcpreplay('4.5.1')
+    vde2('2.3.3')
+
+    # Load extensions
+    ext = ROOT/'setup.d'
+    if ext.is_dir():
+        for py in sorted(ext.glob('*.py')):
+            print(f"\nAdding packages: {py.name}")
+            exec(compile(py.read_text(), str(py), 'exec'), globals(), globals())
+
+    # Topo sort
+    seen, ordered = set(), []
+    def visit(pkg):
+        if pkg in seen: return
+        seen.add(pkg)
+        for dep in DEPS.get(pkg, ()):
+            visit(dep)
+        ordered.append(pkg)
+    for pkg in PLAN:
+        visit(pkg)
+
+    # Build
+    print(f'\nProcessing {len(PLAN)} pkgs...')
+    PKGS.mkdir(exist_ok=True)
+    WORK.mkdir(exist_ok=True)
+    for pkg in ordered:
+        if pkg in PLAN:
+            PLAN[pkg]()
+
+    print('Creating prefix...')
+    # Binaries
+    for dir in ['bin', 'lib']:
+        dst = PREFIX/dir
+        sh(f'rm -rf {dst} && mkdir {dst}')
+        for pkg in sorted(PKGS.iterdir()):
+            src = pkg/dir
+            if src.is_dir():
+                sh(f'ln -sfr {src}/* {dst}/')
+    # Config
+    def conf(src: Path, dst: Path = None):
+        sh(f'mkdir -p $(dirname {PREFIX}/config/{dst or src})')
+        sh(f'ln -sfr {ROOT}/config/{src} {PREFIX}/config/{dst or src}')
+
+    sh(f'rm -rf {PREFIX}/config && mkdir {PREFIX}/config')
+    conf('git')
+    conf('tmux.conf', 'tmux/tmux.conf')
+    conf('nvim')
+    conf('config.fish', 'fish/config.fish')
+    conf('direnv.toml')
+    conf('starship.toml')
+    conf('neovide.toml', 'neovide/config.toml')
+    sh(f'mkdir -p {PREFIX}/config/codex')
+    sh(f'ln -s ~/.config/* {PREFIX}/config/ 2>/dev/null || true')
+
+    print('Cleaning up...')
+    sh(f'rm -rf {WORK}/*')
+
+    print('\n✅ Done')

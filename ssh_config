@@ -1,0 +1,2 @@
+Host *
+    RemoteCommand bash -c 'a=~/.dots/activate; [[ -x $a ]] && exec "$a" || exec bash'
